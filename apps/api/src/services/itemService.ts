@@ -1,4 +1,4 @@
-import type { FamilyRole, Item, Prisma } from '@prisma/client';
+import type { FamilyRole, Item, PersonRole, Prisma } from '@prisma/client';
 import { sortAt as computeSortAt, timelineGroupKey, type Category, type Precision, type Visibility } from '@heirloom/shared';
 import { prisma } from '../db';
 import { badRequest, conflict, forbidden, notFound } from '../http/errors';
@@ -232,7 +232,12 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
     });
 
     await tx.itemVersion.create({
-      data: { itemId: created.id, version: 1, snapshot: toVersionSnapshot(created), createdBy: userId },
+      data: {
+        itemId: created.id,
+        version: 1,
+        snapshot: toVersionSnapshot(created, { people: created.people, sharedWith: input.sharedWith ?? [] }),
+        createdBy: userId,
+      },
     });
     await audit.record(
       {
@@ -250,8 +255,13 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
   });
 }
 
-export function toVersionSnapshot(item: Item): Prisma.InputJsonValue {
-  return {
+export interface VersionSnapshotRelations {
+  people?: { personId: string; role: string }[];
+  sharedWith?: { userId: string; canEdit: boolean }[];
+}
+
+export function toVersionSnapshot(item: Item, relations: VersionSnapshotRelations = {}): Prisma.InputJsonValue {
+  const snapshot: Record<string, unknown> = {
     title: item.title,
     category: item.category,
     status: item.status,
@@ -271,7 +281,16 @@ export function toVersionSnapshot(item: Item): Prisma.InputJsonValue {
     storageLocation: item.storageLocation,
     tags: item.tags,
     coverMediaId: item.coverMediaId,
-  } as unknown as Prisma.InputJsonValue;
+  };
+  // 来源人物与额外授权也是可见字段，一并进快照；调用方没给就不写键，
+  // 回滚遇到缺键的旧快照时保持现状，而不是清空。
+  if (relations.people) {
+    snapshot.people = relations.people.map((p) => ({ personId: p.personId, role: p.role }));
+  }
+  if (relations.sharedWith) {
+    snapshot.sharedWith = relations.sharedWith.map((s) => ({ userId: s.userId, canEdit: s.canEdit }));
+  }
+  return snapshot as Prisma.InputJsonValue;
 }
 
 export async function updateItem(
@@ -298,6 +317,10 @@ export async function updateItem(
       : computeSortAt({ acquiredAt: nextAcquiredAt, acquiredPrecision: nextPrecision }, new Date());
 
   return prisma.$transaction(async (tx) => {
+    const [beforePeople, beforeShares] = await Promise.all([
+      tx.itemPerson.findMany({ where: { itemId } }),
+      tx.itemShare.findMany({ where: { itemId } }),
+    ]);
     const updated = await tx.item.update({
       where: { id: itemId },
       data: {
@@ -340,12 +363,16 @@ export async function updateItem(
       }
     }
 
+    const [afterPeople, afterShares] = await Promise.all([
+      tx.itemPerson.findMany({ where: { itemId } }),
+      tx.itemShare.findMany({ where: { itemId } }),
+    ]);
     const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
     await tx.itemVersion.create({
       data: {
         itemId,
         version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
+        snapshot: toVersionSnapshot(updated, { people: afterPeople, sharedWith: afterShares }),
         createdBy: userId,
       },
     });
@@ -356,7 +383,10 @@ export async function updateItem(
         action: 'item.update',
         targetType: 'item',
         targetId: itemId,
-        diff: audit.diffOf(toVersionSnapshot(item), toVersionSnapshot(updated)),
+        diff: audit.diffOf(
+          toVersionSnapshot(item, { people: beforePeople, sharedWith: beforeShares }),
+          toVersionSnapshot(updated, { people: afterPeople, sharedWith: afterShares }),
+        ),
         ...meta,
       },
       tx,
@@ -488,7 +518,13 @@ export async function revertVersion(
   if (!version) throw notFound('版本不存在');
 
   const snap = version.snapshot as Record<string, unknown>;
+  // 早期快照可能缺键（如 people/sharedWith/coverMediaId）：缺键的字段保持现状，不回滚也不清空
+  const has = (key: string) => Object.prototype.hasOwnProperty.call(snap, key);
   const story = cleanStory(typeof snap.storyHtml === 'string' ? snap.storyHtml : null);
+  const acquiredAt = snap.acquiredAt ? new Date(snap.acquiredAt as string) : null;
+  const acquiredPrecision = (snap.acquiredPrecision as Precision | undefined) ?? 'unknown';
+  const snapPeople = parseSnapPeople(snap.people);
+  const snapShares = parseSnapShares(snap.sharedWith);
 
   return prisma.$transaction(async (tx) => {
     const updated = await tx.item.update({
@@ -497,35 +533,54 @@ export async function revertVersion(
         title: snap.title as string,
         category: snap.category as Category,
         visibility: snap.visibility as Visibility,
-        acquiredAt: snap.acquiredAt ? new Date(snap.acquiredAt as string) : null,
-        acquiredPrecision: snap.acquiredPrecision as Precision,
+        acquiredAt,
+        acquiredPrecision,
         acquiredLabel: (snap.acquiredLabel as string | null) ?? null,
         acquiredNote: (snap.acquiredNote as string | null) ?? null,
         placeText: (snap.placeText as string | null) ?? null,
         placeCity: (snap.placeCity as string | null) ?? null,
         placeProvince: (snap.placeProvince as string | null) ?? null,
         placeCountry: (snap.placeCountry as string | null) ?? null,
+        placeLat: has('placeLat') ? ((snap.placeLat as number | null) ?? null) : undefined,
+        placeLng: has('placeLng') ? ((snap.placeLng as number | null) ?? null) : undefined,
         storyHtml: story.html,
         storyText: story.text || null,
         condition: (snap.condition as string | null) ?? null,
         storageLocation: (snap.storageLocation as string | null) ?? null,
         tags: (snap.tags as string[] | undefined) ?? [],
-        sortAt: computeSortAt(
-          {
-            acquiredAt: snap.acquiredAt ? new Date(snap.acquiredAt as string) : null,
-            acquiredPrecision: snap.acquiredPrecision as Precision,
-          },
-          new Date(),
-        ),
+        coverMediaId: has('coverMediaId') ? ((snap.coverMediaId as string | null) ?? null) : undefined,
+        sortAt: computeSortAt({ acquiredAt, acquiredPrecision }, new Date()),
       },
-      include: LIST_INCLUDE,
     });
+
+    // 来源人物与额外授权随内容一起回滚；旧快照没有这两个键时不动现状
+    if (snapPeople) {
+      await tx.itemPerson.deleteMany({ where: { itemId } });
+      if (snapPeople.length) {
+        await tx.itemPerson.createMany({
+          data: snapPeople.map((p) => ({ itemId, personId: p.personId, role: p.role })),
+        });
+      }
+    }
+    if (snapShares) {
+      await tx.itemShare.deleteMany({ where: { itemId } });
+      if (snapShares.length) {
+        await tx.itemShare.createMany({
+          data: snapShares.map((s) => ({ itemId, userId: s.userId, canEdit: s.canEdit })),
+        });
+      }
+    }
+
+    const [people, shares] = await Promise.all([
+      tx.itemPerson.findMany({ where: { itemId } }),
+      tx.itemShare.findMany({ where: { itemId } }),
+    ]);
     const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
     await tx.itemVersion.create({
       data: {
         itemId,
         version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
+        snapshot: toVersionSnapshot(updated, { people, sharedWith: shares }),
         createdBy: userId,
       },
     });
@@ -541,8 +596,30 @@ export async function revertVersion(
       },
       tx,
     );
-    return toItemDto(updated, ctx.familyId);
+    const withRelations = await tx.item.findUniqueOrThrow({ where: { id: itemId }, include: LIST_INCLUDE });
+    return toItemDto(withRelations, ctx.familyId);
   });
+}
+
+const PERSON_ROLES = new Set<string>(['source', 'gifted', 'inherited', 'owner', 'mentioned']);
+
+/** 从快照里解析来源人物；键缺失或不是数组时返回 null（表示「不还原该字段」）。 */
+export function parseSnapPeople(value: unknown): { personId: string; role: PersonRole }[] | null {
+  if (!Array.isArray(value)) return null;
+  return value
+    .filter((p): p is { personId: string; role?: unknown } => typeof p?.personId === 'string')
+    .map((p) => ({
+      personId: p.personId,
+      role: (typeof p.role === 'string' && PERSON_ROLES.has(p.role) ? p.role : 'source') as PersonRole,
+    }));
+}
+
+/** 从快照里解析额外授权；键缺失或不是数组时返回 null（表示「不还原该字段」）。 */
+export function parseSnapShares(value: unknown): { userId: string; canEdit: boolean }[] | null {
+  if (!Array.isArray(value)) return null;
+  return value
+    .filter((s): s is { userId: string; canEdit?: unknown } => typeof s?.userId === 'string')
+    .map((s) => ({ userId: s.userId, canEdit: s.canEdit === true }));
 }
 
 export interface TimelineGroup {

@@ -88,12 +88,16 @@ export async function acceptNote(
       data: { status: 'accepted', decidedBy: userId, decidedAt: new Date() },
       include: { author: { select: { id: true, displayName: true, avatarColor: true } } },
     });
+    const [people, shares] = await Promise.all([
+      tx.itemPerson.findMany({ where: { itemId } }),
+      tx.itemShare.findMany({ where: { itemId } }),
+    ]);
     const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
     await tx.itemVersion.create({
       data: {
         itemId,
         version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updatedItem),
+        snapshot: toVersionSnapshot(updatedItem, { people, sharedWith: shares }),
         createdBy: userId,
       },
     });
