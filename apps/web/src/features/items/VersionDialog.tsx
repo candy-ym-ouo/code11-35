@@ -8,7 +8,13 @@ interface Version {
   id: string;
   version: number;
   createdAt: string;
-  snapshot: { title?: string; storyHtml?: string | null };
+  snapshot: {
+    title?: string;
+    storyHtml?: string | null;
+    coverMediaId?: string | null;
+    people?: { personId: string; role: string }[];
+    shares?: { userId: string; canEdit: boolean }[];
+  };
 }
 
 export function VersionDialog({

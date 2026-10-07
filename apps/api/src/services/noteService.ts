@@ -89,11 +89,16 @@ export async function acceptNote(
       include: { author: { select: { id: true, displayName: true, avatarColor: true } } },
     });
     const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
+    // 采纳补充只改了故事，快照仍须带上人物/授权现状，否则回滚到该版本会误清空关系
+    const [people, shares] = await Promise.all([
+      tx.itemPerson.findMany({ where: { itemId } }),
+      tx.itemShare.findMany({ where: { itemId } }),
+    ]);
     await tx.itemVersion.create({
       data: {
         itemId,
         version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updatedItem),
+        snapshot: toVersionSnapshot(updatedItem, people, shares),
         createdBy: userId,
       },
     });

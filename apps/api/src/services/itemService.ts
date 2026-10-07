@@ -1,5 +1,16 @@
 import type { FamilyRole, Item, Prisma } from '@prisma/client';
-import { sortAt as computeSortAt, timelineGroupKey, type Category, type Precision, type Visibility } from '@heirloom/shared';
+import {
+  sortAt as computeSortAt,
+  timelineGroupKey,
+  CATEGORIES,
+  PERSON_ROLES,
+  PRECISIONS,
+  VISIBILITIES,
+  type Category,
+  type PersonRole,
+  type Precision,
+  type Visibility,
+} from '@heirloom/shared';
 import { prisma } from '../db';
 import { badRequest, conflict, forbidden, notFound } from '../http/errors';
 import { cleanStory } from '../utils/sanitize';
@@ -231,8 +242,14 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
       include: LIST_INCLUDE,
     });
 
+    const createdShares = await tx.itemShare.findMany({ where: { itemId: created.id } });
     await tx.itemVersion.create({
-      data: { itemId: created.id, version: 1, snapshot: toVersionSnapshot(created), createdBy: userId },
+      data: {
+        itemId: created.id,
+        version: 1,
+        snapshot: toVersionSnapshot(created, created.people, createdShares),
+        createdBy: userId,
+      },
     });
     await audit.record(
       {
@@ -250,7 +267,25 @@ export async function createItem(userId: string, ctx: FamilyContext, input: Item
   });
 }
 
-export function toVersionSnapshot(item: Item): Prisma.InputJsonValue {
+export interface SnapshotPerson {
+  personId: string;
+  role: PersonRole;
+}
+export interface SnapshotShare {
+  userId: string;
+  canEdit: boolean;
+}
+
+/**
+ * 版本快照覆盖条目全部「可见内容」：标量字段、封面、来源人物、额外授权。
+ * 媒体文件本身不入库快照（删除/新增媒体不属于条目编辑历史），封面只记录指向。
+ * 关系行可选：未 include 时按空集合处理，避免快照结构因调用方而异。
+ */
+export function toVersionSnapshot(
+  item: Item,
+  people: SnapshotPerson[] = [],
+  shares: SnapshotShare[] = [],
+): Prisma.InputJsonValue {
   return {
     title: item.title,
     category: item.category,
@@ -271,6 +306,8 @@ export function toVersionSnapshot(item: Item): Prisma.InputJsonValue {
     storageLocation: item.storageLocation,
     tags: item.tags,
     coverMediaId: item.coverMediaId,
+    people: people.map((p) => ({ personId: p.personId, role: p.role })),
+    shares: shares.map((s) => ({ userId: s.userId, canEdit: s.canEdit })),
   } as unknown as Prisma.InputJsonValue;
 }
 
@@ -287,6 +324,12 @@ export async function updateItem(
 
   await assertPeopleBelongToFamily(ctx.familyId, (input.people ?? []).map((p) => p.personId));
   await assertUsersBelongToFamily(ctx.familyId, (input.sharedWith ?? []).map((s) => s.userId));
+
+  // 审计 before 需要包含关系行；本次未提交的字段在快照里也应呈现旧值
+  const [beforePeople, beforeShares] = await prisma.$transaction([
+    prisma.itemPerson.findMany({ where: { itemId } }),
+    prisma.itemShare.findMany({ where: { itemId } }),
+  ]);
 
   const story = input.storyHtml === undefined ? { html: null as string | null, text: '' } : cleanStory(input.storyHtml);
   const nextAcquiredAt =
@@ -341,11 +384,15 @@ export async function updateItem(
     }
 
     const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
+    const [afterPeople, afterShares] = await Promise.all([
+      tx.itemPerson.findMany({ where: { itemId } }),
+      tx.itemShare.findMany({ where: { itemId } }),
+    ]);
     await tx.itemVersion.create({
       data: {
         itemId,
         version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
+        snapshot: toVersionSnapshot(updated, afterPeople, afterShares),
         createdBy: userId,
       },
     });
@@ -356,7 +403,10 @@ export async function updateItem(
         action: 'item.update',
         targetType: 'item',
         targetId: itemId,
-        diff: audit.diffOf(toVersionSnapshot(item), toVersionSnapshot(updated)),
+        diff: audit.diffOf(
+          toVersionSnapshot(item, beforePeople, beforeShares),
+          toVersionSnapshot(updated, afterPeople, afterShares),
+        ),
         ...meta,
       },
       tx,
@@ -475,6 +525,83 @@ export async function listVersions(ctx: FamilyContext, itemId: string) {
   }));
 }
 
+/**
+ * 早期版本的快照并不包含后来新增的字段（封面、坐标、来源人物、额外授权等）。
+ * 统一通过这些 helper 取值：键不存在时返回 undefined，由上层决定「保留现值」，
+ * 而不是把缺失误读成 null 清空字段。
+ */
+export function hasKey(snap: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(snap, key);
+}
+
+export function snapString(snap: Record<string, unknown>, key: string): string | null | undefined {
+  if (!hasKey(snap, key)) return undefined;
+  const v = snap[key];
+  return typeof v === 'string' ? v : v == null ? null : undefined;
+}
+
+export function snapEnum<T extends string>(
+  snap: Record<string, unknown>,
+  key: string,
+  allowed: readonly T[],
+): T | null | undefined {
+  if (!hasKey(snap, key)) return undefined;
+  const v = snap[key];
+  return typeof v === 'string' && (allowed as readonly string[]).includes(v) ? (v as T) : null;
+}
+
+export function snapTags(snap: Record<string, unknown>): string[] | undefined {
+  if (!hasKey(snap, 'tags')) return undefined;
+  const v = snap.tags;
+  if (!Array.isArray(v)) return [];
+  return v.filter((t): t is string => typeof t === 'string');
+}
+
+export function snapNumber(snap: Record<string, unknown>, key: string): number | null | undefined {
+  if (!hasKey(snap, key)) return undefined;
+  const v = snap[key];
+  if (v == null) return null;
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+export function snapPeople(snap: Record<string, unknown>): SnapshotPerson[] | undefined {
+  if (!hasKey(snap, 'people')) return undefined;
+  const v = snap.people;
+  if (!Array.isArray(v)) return [];
+  const out: SnapshotPerson[] = [];
+  const seen = new Set<string>();
+  for (const row of v) {
+    if (!row || typeof row !== 'object') continue;
+    const r = row as Record<string, unknown>;
+    if (typeof r.personId !== 'string') continue;
+    const role = typeof r.role === 'string' && (PERSON_ROLES as readonly string[]).includes(r.role)
+      ? (r.role as PersonRole)
+      : 'source';
+    const dedupe = `${r.personId}:${role}`;
+    if (seen.has(dedupe)) continue;
+    seen.add(dedupe);
+    out.push({ personId: r.personId, role });
+  }
+  return out;
+}
+
+export function snapShares(snap: Record<string, unknown>): SnapshotShare[] | undefined {
+  if (!hasKey(snap, 'shares')) return undefined;
+  const v = snap.shares;
+  if (!Array.isArray(v)) return [];
+  const out: SnapshotShare[] = [];
+  const seen = new Set<string>();
+  for (const row of v) {
+    if (!row || typeof row !== 'object') continue;
+    const r = row as Record<string, unknown>;
+    if (typeof r.userId !== 'string' || seen.has(r.userId)) continue;
+    seen.add(r.userId);
+    out.push({ userId: r.userId, canEdit: r.canEdit === true });
+  }
+  return out;
+}
+
 export async function revertVersion(
   userId: string,
   ctx: FamilyContext,
@@ -482,50 +609,149 @@ export async function revertVersion(
   versionId: string,
   meta: ActorMeta,
 ) {
-  const { access } = await itemWithAccess(userId, ctx, itemId);
+  const { item, access } = await itemWithAccess(userId, ctx, itemId);
   if (!access.canEdit) throw forbidden();
   const version = await prisma.itemVersion.findFirst({ where: { id: versionId, itemId } });
   if (!version) throw notFound('版本不存在');
 
-  const snap = version.snapshot as Record<string, unknown>;
-  const story = cleanStory(typeof snap.storyHtml === 'string' ? snap.storyHtml : null);
+  const snap = (version.snapshot ?? {}) as Record<string, unknown>;
+
+  // 缺失键一律保留现值，兼容字段补齐之前的老快照；显式 null 表示该版本本来就为空，应清空
+  // 标题为必填：老快照缺失时退回现值；值损坏（非字符串）则拒绝回滚，避免写入空标题
+  const titleRaw = snapString(snap, 'title');
+  if (titleRaw !== undefined && (titleRaw === null || titleRaw.trim().length === 0)) {
+    throw badRequest('该版本快照缺少有效标题，无法回滚');
+  }
+  const title = titleRaw ?? item.title;
+  const category = snapEnum(snap, 'category', CATEGORIES) ?? item.category;
+  const visibility = snapEnum(snap, 'visibility', VISIBILITIES) ?? item.visibility;
+  const precision = snapEnum(snap, 'acquiredPrecision', PRECISIONS) ?? item.acquiredPrecision;
+  const acquiredAtRaw = hasKey(snap, 'acquiredAt')
+    ? typeof snap.acquiredAt === 'string' && !Number.isNaN(Date.parse(snap.acquiredAt))
+      ? new Date(snap.acquiredAt)
+      : null
+    : item.acquiredAt;
+  // storyHtml 缺失时保留现值；显式 null / 非字符串按「无故事」清洗
+  const storySource = hasKey(snap, 'storyHtml')
+    ? typeof snap.storyHtml === 'string'
+      ? snap.storyHtml
+      : null
+    : item.storyHtml;
+  const story = cleanStory(storySource);
+
+  /** 快照有键（含 null）用快照值，无键则保留回滚前的值 */
+  const orKeep = <T>(v: T | null | undefined, current: T): T | null => (v === undefined ? current : v);
+
+  // 来源人物 / 额外授权在早期快照中不存在：键缺失时不动现状，存在时整组替换（含清空）
+  const peopleSnap = snapPeople(snap);
+  const sharesSnap = snapShares(snap);
+
+  // 封面只允许指向本条目现存的图片媒体；引用已删除/非法媒体时回落为无封面
+  let coverMediaId: string | null | undefined;
+  if (hasKey(snap, 'coverMediaId')) {
+    const wanted = snap.coverMediaId;
+    if (typeof wanted !== 'string' || wanted.length === 0) {
+      coverMediaId = null;
+    } else {
+      const media = await prisma.itemMedia.findFirst({
+        where: { id: wanted, itemId, deletedAt: null, kind: 'image' },
+        select: { id: true },
+      });
+      coverMediaId = media?.id ?? null;
+    }
+  }
+
+  // 快照里的关系目标可能已被删除/合并/退出家庭，回滚前过滤掉，避免外键失败
+  let peopleRows: { personId: string; role: PersonRole }[] = [];
+  if (peopleSnap) {
+    if (peopleSnap.length) {
+      const validPeople = await prisma.person.findMany({
+        where: {
+          familyId: ctx.familyId,
+          deletedAt: null,
+          id: { in: [...new Set(peopleSnap.map((p) => p.personId))] },
+        },
+        select: { id: true },
+      });
+      const validIds = new Set(validPeople.map((p) => p.id));
+      peopleRows = peopleSnap.filter((p) => validIds.has(p.personId));
+    }
+  }
+  let sharesRows: { userId: string; canEdit: boolean }[] = [];
+  if (sharesSnap) {
+    if (sharesSnap.length) {
+      const validMembers = await prisma.familyMember.findMany({
+        where: { familyId: ctx.familyId, status: 'active', userId: { in: sharesSnap.map((s) => s.userId) } },
+        select: { userId: true },
+      });
+      const validUserIds = new Set(validMembers.map((m) => m.userId));
+      sharesRows = sharesSnap.filter((s) => validUserIds.has(s.userId));
+    }
+  }
+
+  // 时间字段缺失（老快照）时沿用原排序值，避免把所有历史条目顶到时间轴最前
+  const sortAt =
+    hasKey(snap, 'acquiredAt') || hasKey(snap, 'acquiredPrecision')
+      ? computeSortAt({ acquiredAt: acquiredAtRaw, acquiredPrecision: precision }, new Date())
+      : item.sortAt;
 
   return prisma.$transaction(async (tx) => {
     const updated = await tx.item.update({
       where: { id: itemId },
       data: {
-        title: snap.title as string,
-        category: snap.category as Category,
-        visibility: snap.visibility as Visibility,
-        acquiredAt: snap.acquiredAt ? new Date(snap.acquiredAt as string) : null,
-        acquiredPrecision: snap.acquiredPrecision as Precision,
-        acquiredLabel: (snap.acquiredLabel as string | null) ?? null,
-        acquiredNote: (snap.acquiredNote as string | null) ?? null,
-        placeText: (snap.placeText as string | null) ?? null,
-        placeCity: (snap.placeCity as string | null) ?? null,
-        placeProvince: (snap.placeProvince as string | null) ?? null,
-        placeCountry: (snap.placeCountry as string | null) ?? null,
+        title,
+        category,
+        visibility,
+        acquiredAt: acquiredAtRaw,
+        acquiredPrecision: precision,
+        acquiredLabel: orKeep(snapString(snap, 'acquiredLabel'), item.acquiredLabel),
+        acquiredNote: orKeep(snapString(snap, 'acquiredNote'), item.acquiredNote),
+        placeText: orKeep(snapString(snap, 'placeText'), item.placeText),
+        placeCity: orKeep(snapString(snap, 'placeCity'), item.placeCity),
+        placeProvince: orKeep(snapString(snap, 'placeProvince'), item.placeProvince),
+        placeCountry: orKeep(snapString(snap, 'placeCountry'), item.placeCountry),
+        placeLat: orKeep(snapNumber(snap, 'placeLat'), item.placeLat as number | null),
+        placeLng: orKeep(snapNumber(snap, 'placeLng'), item.placeLng as number | null),
         storyHtml: story.html,
         storyText: story.text || null,
-        condition: (snap.condition as string | null) ?? null,
-        storageLocation: (snap.storageLocation as string | null) ?? null,
-        tags: (snap.tags as string[] | undefined) ?? [],
-        sortAt: computeSortAt(
-          {
-            acquiredAt: snap.acquiredAt ? new Date(snap.acquiredAt as string) : null,
-            acquiredPrecision: snap.acquiredPrecision as Precision,
-          },
-          new Date(),
-        ),
+        condition: orKeep(snapString(snap, 'condition'), item.condition),
+        storageLocation: orKeep(snapString(snap, 'storageLocation'), item.storageLocation),
+        tags: snapTags(snap) ?? item.tags,
+        coverMediaId: coverMediaId === undefined ? undefined : coverMediaId,
+        sortAt,
+        // status 是发布状态机而非条目内容，回滚历史不应把已发布条目打回草稿
+        status: item.status,
       },
       include: LIST_INCLUDE,
     });
+
+    if (peopleSnap) {
+      await tx.itemPerson.deleteMany({ where: { itemId } });
+      if (peopleRows.length) {
+        await tx.itemPerson.createMany({
+          data: peopleRows.map((p) => ({ itemId, personId: p.personId, role: p.role })),
+        });
+      }
+    }
+    if (sharesSnap) {
+      await tx.itemShare.deleteMany({ where: { itemId } });
+      if (sharesRows.length) {
+        await tx.itemShare.createMany({
+          data: sharesRows.map((s) => ({ itemId, userId: s.userId, canEdit: s.canEdit })),
+        });
+      }
+    }
+
+    const [afterPeople, afterShares] = await Promise.all([
+      tx.itemPerson.findMany({ where: { itemId } }),
+      tx.itemShare.findMany({ where: { itemId } }),
+    ]);
     const last = await tx.itemVersion.findFirst({ where: { itemId }, orderBy: { version: 'desc' } });
     await tx.itemVersion.create({
       data: {
         itemId,
         version: (last?.version ?? 0) + 1,
-        snapshot: toVersionSnapshot(updated),
+        snapshot: toVersionSnapshot(updated, afterPeople, afterShares),
         createdBy: userId,
       },
     });
@@ -541,7 +767,9 @@ export async function revertVersion(
       },
       tx,
     );
-    return toItemDto(updated, ctx.familyId);
+
+    const withRelations = await tx.item.findUniqueOrThrow({ where: { id: itemId }, include: LIST_INCLUDE });
+    return toItemDto(withRelations, ctx.familyId);
   });
 }
 
